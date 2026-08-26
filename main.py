@@ -15,12 +15,10 @@ from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
-# 1. CORS 강제 통과
+# 1. CORS 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -65,61 +63,8 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 STORAGE_DIR = "task_storage"
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
-
-# 2. 로컬 JSON 파일 직접 로드 (줄바꿈 오류 완전 배제)
-def get_gspread_client():
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/spreadsheets"
-    ]
-    
-    # 1순위: GitHub에 업로드된 프로젝트 내 파일
-    for filename in ["google_creds.json", "/etc/secrets/google_creds.json"]:
-        if os.path.exists(filename):
-            try:
-                creds = ServiceAccountCredentials.from_json_keyfile_name(filename, scope)
-                return gspread.authorize(creds), None
-            except Exception as e:
-                return None, f"파일 인증 실패({filename}): {str(e)}"
-                
-    # 2순위: 환경변수 파싱
-    creds_raw = os.getenv("GOOGLE_CREDS_JSON", "").strip()
-    if creds_raw:
-        try:
-            creds_dict = json.loads(creds_raw)
-            if "private_key" in creds_dict:
-                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            return gspread.authorize(creds), None
-        except Exception as e:
-            return None, f"환경변수 파싱 실패: {str(e)}"
-
-    return None, "google_creds.json 파일을 찾을 수 없습니다."
-
-# 3. 워크시트 탐색
-def get_target_sheet(gc):
-    try:
-        ss = gc.open_by_key(SPREADSHEET_ID)
-        return ss.get_worksheet(0), None
-    except Exception as e:
-        id_err = str(e)
-
-    try:
-        ss = gc.open("블로그넷_회원관리")
-        return ss.get_worksheet(0), None
-    except Exception as e:
-        name_err = str(e)
-
-    try:
-        all_s = gc.openall()
-        if all_s:
-            return all_s[0].get_worksheet(0), None
-    except Exception:
-        pass
-
-    return None, f"시트 탐색 실패 (ID: {id_err})"
+# ⭐️ 구글 Apps Script 배포 웹앱 URL 직통 연결
+GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxD-zsNjafVwwPQmo4NOhWSu48hTE5QlX59CnylsV8l0SlqPk4zU8oudAlyEILVx_s/exec"
 
 class PointRequest(BaseModel):
     email: str
@@ -181,70 +126,34 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 포인트 실시간 조회
+# ⭐️ 1. 실시간 포인트 조회 API (Apps Script 연동)
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
-    gc, auth_err = get_gspread_client()
-    if not gc:
-        return {"point": 0, "err_msg": auth_err}
-
-    sheet, sheet_err = get_target_sheet(gc)
-    if not sheet:
-        return {"point": 0, "err_msg": sheet_err}
-
     try:
-        records = sheet.get_all_values()
-        search_email = req.email.strip().lower()
-        
-        for row in records[1:]:
-            if len(row) >= 1:
-                cell_email = row[0].strip().lower()
-                if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
-                    raw_val = row[1] if len(row) > 1 else "0"
-                    clean_num = re.sub(r"[^\d]", "", str(raw_val))
-                    return {"point": int(clean_num or 0), "status": "success", "user": cell_email}
-        
-        if len(records) >= 2 and len(records[1]) >= 2:
-            raw_val = records[1][1]
-            clean_num = re.sub(r"[^\d]", "", str(raw_val))
-            return {"point": int(clean_num or 0), "status": "fallback_row2", "user": records[1][0]}
-
-        return {"point": 0, "err_msg": "시트에 데이터 없음"}
+        params = {"email": req.email.strip().lower(), "action": "get"}
+        resp = requests.get(GAS_WEBAPP_URL, params=params, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"point": int(data.get("point", 0)), "status": "success", "user": req.email}
+        return {"point": 0, "err_msg": f"Google Script 응답 코드: {resp.status_code}"}
     except Exception as e:
-        return {"point": 0, "err_msg": f"데이터 파싱 실패: {str(e)}"}
+        return {"point": 0, "err_msg": f"통신 오류: {str(e)}"}
 
-# ⭐️ 원고 생성 및 차감
+# ⭐️ 2. 원고 일괄 생성 및 포인트 차감 API (Apps Script 연동)
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    gc, _ = get_gspread_client()
-    sheet = None
-    target_row = 2
+    # 잔여 포인트 사전 확인
     current_p = 0
-    search_email = req.user_email.strip().lower()
-
-    if gc:
-        try:
-            sheet, _ = get_target_sheet(gc)
-            if sheet:
-                records = sheet.get_all_values()
-                for row_idx, row in enumerate(records[1:], start=2):
-                    if len(row) >= 1:
-                        cell_email = row[0].strip().lower()
-                        if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
-                            target_row = row_idx
-                            raw_val = row[1] if len(row) > 1 else "0"
-                            current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
-                            break
-                
-                if target_row == 2 and len(records) >= 2:
-                    raw_val = records[1][1] if len(records[1]) > 1 else "0"
-                    current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
-        except Exception as e:
-            print(f"[ERROR] 시트 조회 실패: {e}")
+    try:
+        resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            current_p = int(resp.json().get("point", 0))
+    except Exception as e:
+        print(f"[ERROR] 포인트 확인 통신 실패: {e}")
 
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
@@ -317,19 +226,22 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
+    # ⭐️ 구글 스프레드시트 실시간 차감 요청 (Apps Script 호출)
     remaining_point = max(0, current_p - req.cost)
+    try:
+        deduct_params = {
+            "email": req.user_email.strip().lower(),
+            "action": "deduct",
+            "cost": req.cost
+        }
+        d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=10, allow_redirects=True)
+        if d_resp.status_code == 200:
+            remaining_point = int(d_resp.json().get("point", remaining_point))
+    except Exception as e:
+        print(f"[ERROR] 구글 시트 포인트 차감 실패: {e}")
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
-
-    try:
-        if sheet and target_row:
-            sheet.update_cell(target_row, 2, remaining_point)
-            raw_used = sheet.cell(target_row, 3).value or "0"
-            prev_used = int(re.sub(r"[^\d]", "", str(raw_used)) or 0)
-            sheet.update_cell(target_row, 3, prev_used + req.cost)
-            sheet.update_cell(target_row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    except Exception as e:
-        print(f"[ERROR] 시트 포인트 차감 에러: {e}")
 
     meta = {
         "task_id": task_id,
@@ -347,6 +259,7 @@ def generate_content(req: GenerateRequest):
         "remaining_point": remaining_point
     }
 
+# ⭐️ 3. 최근 생성 내역 조회 API
 @app.get("/api/history/{user_email}")
 def get_user_history(user_email: str):
     history = []
@@ -363,6 +276,7 @@ def get_user_history(user_email: str):
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return {"history": history}
 
+# ⭐️ 4. 파일 다운로드 API
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
     task_dir = os.path.join(STORAGE_DIR, task_id)
