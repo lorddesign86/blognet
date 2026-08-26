@@ -16,11 +16,11 @@ import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
-# 1. CORS 강제 통과 미들웨어
+# 1. CORS 완벽 대응 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -65,68 +65,73 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 STORAGE_DIR = "task_storage"
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
+# ⭐️ 구글 스프레드시트 고유 ID
 SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 
-# 2. JWT 서명 오류 방지 구글 인증 함수
+# 2. 구글 인증 클라이언트 생성 (Secret File 및 환경변수 완벽 호환)
 def get_gspread_client():
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/spreadsheets"
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
     ]
     
-    # 1순위: Render Secret Files 경로 탐색 (/etc/secrets/google_creds.json)
-    secret_paths = ["/etc/secrets/google_creds.json", "google_creds.json"]
+    # 1순위: Render Secret File 경로
+    secret_paths = [
+        "/etc/secrets/google_creds.json",
+        os.path.join(os.getcwd(), "google_creds.json"),
+        "google_creds.json"
+    ]
     for path in secret_paths:
         if os.path.exists(path):
             try:
-                creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
+                creds = Credentials.from_service_account_file(path, scopes=scopes)
                 return gspread.authorize(creds), None
             except Exception as e:
-                print(f"[KEYFILE_ERROR] {path}: {e}")
+                print(f"[KEYFILE_ERROR] {path} 파일 인증 실패: {e}")
 
-    # 2순위: 환경변수 줄바꿈(\n) 복원 처리
+    # 2순위: GOOGLE_CREDS_JSON 환경변수 (줄바꿈 자동 복원)
     creds_raw = os.getenv("GOOGLE_CREDS_JSON", "").strip()
     if creds_raw:
         try:
             creds_dict = json.loads(creds_raw)
             if "private_key" in creds_dict:
-                # 줄바꿈 복원 핵심 처리
                 pk = creds_dict["private_key"]
                 if "\\n" in pk:
                     creds_dict["private_key"] = pk.replace("\\n", "\n")
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
             return gspread.authorize(creds), None
         except Exception as e:
             return None, f"환경변수 파싱 실패: {str(e)}"
             
-    return None, "인증 키(GOOGLE_CREDS_JSON)가 없습니다."
+    return None, "구글 인증 키(GOOGLE_CREDS_JSON)를 찾을 수 없습니다."
 
-# 3. 구글 시트 탐색 (ID 및 이름 다중 탐색)
+# 3. 구글 시트 워크시트 탐색 (ID 직통 및 첫 번째 탭 자동 로드)
 def get_target_sheet(gc):
-    # 1) 고유 ID로 열기
+    # 1) 고유 ID로 첫 번째 탭 열기
     try:
         ss = gc.open_by_key(SPREADSHEET_ID)
-        return ss.sheet1
-    except Exception:
-        pass
-
-    # 2) 파일 이름 '블로그넷_회원관리'로 열기
+        return ss.get_worksheet(0), None
+    except Exception as e:
+        id_err = str(e)
+    
+    # 2) 파일 이름으로 첫 번째 탭 열기
     try:
         ss = gc.open("블로그넷_회원관리")
-        return ss.sheet1
-    except Exception:
-        pass
+        return ss.get_worksheet(0), None
+    except Exception as e:
+        name_err = str(e)
 
-    # 3) 공유된 첫 번째 시트 열기
+    # 3) 공유된 첫 번째 스프레드시트 열기
     try:
         all_s = gc.openall()
         if all_s:
-            return all_s[0].sheet1
-    except Exception:
-        pass
+            return all_s[0].get_worksheet(0), None
+        else:
+            return None, "서비스 계정에 공유된 스프레드시트가 0개입니다."
+    except Exception as e:
+        list_err = str(e)
 
-    return None
+    return None, f"ID열기실패({id_err}) / 이름열기실패({name_err}) / 목록열기실패({list_err})"
 
 class PointRequest(BaseModel):
     email: str
@@ -188,21 +193,22 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 포인트 조회
+# ⭐️ 1. 실시간 포인트 조회 엔드포인트
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     gc, auth_err = get_gspread_client()
     if not gc:
         return {"point": 0, "err_msg": f"인증 실패: {auth_err}"}
 
-    sheet = get_target_sheet(gc)
+    sheet, sheet_err = get_target_sheet(gc)
     if not sheet:
-        return {"point": 0, "err_msg": "시트를 찾을 수 없습니다 ('블로그넷_회원관리' 확인 필요)"}
+        return {"point": 0, "err_msg": f"시트 열기 실패: {sheet_err}"}
 
     try:
         records = sheet.get_all_values()
         search_email = req.email.strip().lower()
         
+        # A열 이메일 대조
         for row in records[1:]:
             if len(row) >= 1:
                 cell_email = row[0].strip().lower()
@@ -211,16 +217,17 @@ def get_user_point(req: PointRequest):
                     clean_num = re.sub(r"[^\d]", "", str(raw_val))
                     return {"point": int(clean_num or 0), "status": "success", "user": cell_email}
         
+        # 불일치 시 2행 첫 번째 데이터 제공
         if len(records) >= 2 and len(records[1]) >= 2:
             raw_val = records[1][1]
             clean_num = re.sub(r"[^\d]", "", str(raw_val))
             return {"point": int(clean_num or 0), "status": "fallback_row2", "user": records[1][0]}
 
-        return {"point": 0, "err_msg": "시트에 데이터가 없습니다"}
+        return {"point": 0, "err_msg": "시트에 회원 데이터가 없습니다."}
     except Exception as e:
         return {"point": 0, "err_msg": f"데이터 읽기 실패: {str(e)}"}
 
-# ⭐️ 원고 생성 및 차감
+# ⭐️ 2. 원고 일괄 생성 및 포인트 실시간 차감 엔드포인트
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
@@ -235,7 +242,7 @@ def generate_content(req: GenerateRequest):
 
     if gc:
         try:
-            sheet = get_target_sheet(gc)
+            sheet, _ = get_target_sheet(gc)
             if sheet:
                 records = sheet.get_all_values()
                 for row_idx, row in enumerate(records[1:], start=2):
@@ -251,8 +258,9 @@ def generate_content(req: GenerateRequest):
                     raw_val = records[1][1] if len(records[1]) > 1 else "0"
                     current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
         except Exception as e:
-            print(f"[ERROR] 시트 조회 에러: {e}")
+            print(f"[ERROR] 시트 포인트 조회 에러: {e}")
 
+    # 잔여 포인트 부족 검증
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
 
@@ -324,6 +332,7 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
+    # 구글 시트 실시간 차감 및 사용 기록
     remaining_point = max(0, current_p - req.cost)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
@@ -336,7 +345,7 @@ def generate_content(req: GenerateRequest):
             sheet.update_cell(target_row, 3, prev_used + req.cost)
             sheet.update_cell(target_row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as e:
-        print(f"[ERROR] 시트 포인트 차감 에러: {e}")
+        print(f"[ERROR] 구글 시트 포인트 차감 에러: {e}")
 
     meta = {
         "task_id": task_id,
@@ -354,6 +363,7 @@ def generate_content(req: GenerateRequest):
         "remaining_point": remaining_point
     }
 
+# ⭐️ 3. 최근 다운로드 내역 조회 엔드포인트
 @app.get("/api/history/{user_email}")
 def get_user_history(user_email: str):
     history = []
@@ -370,6 +380,7 @@ def get_user_history(user_email: str):
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return {"history": history}
 
+# ⭐️ 4. 파일 다운로드 엔드포인트
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
     task_dir = os.path.join(STORAGE_DIR, task_id)
