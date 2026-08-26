@@ -233,26 +233,28 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # ⭐️ 이미지 생성 처리
+    # ⭐️ 공식 DALL-E 3 실시간 이미지 생성
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
             try:
-                img_prompt = f"Professional clean aesthetic commercial photography of {req.brand or req.keyword}, photo taken with DSLR, natural lighting, high quality, realistic, no text"
-                # 빠르고 안정적인 DALL-E 이미지 생성
+                subject_name = req.brand if req.brand else req.keyword
+                img_prompt = f"A professional, realistic commercial DSLR photo of {subject_name}, clean aesthetic composition, high resolution, 4k quality, natural lighting, absolutely no text, no letters."
+                
                 img_resp = client.images.generate(
-                    model="dall-e-2",
-                    prompt=img_prompt[:950],
-                    size="512x512",
+                    model="dall-e-3",
+                    prompt=img_prompt,
+                    size="1024x1024",
+                    quality="standard",
                     n=1
                 )
                 img_url = img_resp.data[0].url
-                img_data = requests.get(img_url, timeout=15).content
+                img_data = requests.get(img_url, timeout=20).content
                 with open(os.path.join(task_dir, f"image_{i+1}.jpg"), "wb") as f:
                     f.write(img_data)
                 images_created += 1
             except Exception as e:
-                print(f"[ERROR] 이미지 {i+1}번 생성 실패: {e}")
+                print(f"[ERROR] 이미지 {i+1}번 DALL-E 3 생성 실패: {e}")
 
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
     channel_display = channel_labels.get(req.channel, "블로그")
@@ -296,7 +298,6 @@ def download_result(task_id: str):
     if not os.path.exists(task_dir):
         raise HTTPException(status_code=404, detail="다운로드 대상이 존재하지 않습니다.")
 
-    # 이미지 파일이 있는지 확인
     jpg_files = [f for f in os.listdir(task_dir) if f.endswith(".jpg")]
 
     if len(jpg_files) == 0:
@@ -305,7 +306,7 @@ def download_result(task_id: str):
             return FileResponse(path=txt_path, filename="원고.txt", media_type="text/plain; charset=utf-8")
         raise HTTPException(status_code=404, detail="원고 파일이 없습니다.")
 
-    # 이미지가 1장 이상이면 ZIP 압축 파일로 제공
+    # 이미지가 있으면 이미지와 텍스트를 담은 ZIP 압축 파일 제공
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, "w") as zf:
         for root, _, files in os.walk(task_dir):
