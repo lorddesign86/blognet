@@ -19,7 +19,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
-# --- 1. CORS 통과 미들웨어 ---
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -58,7 +57,6 @@ async def preflight_handler(rest_of_path: str):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# --- 2. 설정 및 초기화 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -73,7 +71,6 @@ def get_gspread_client():
         return gspread.authorize(creds)
     return None
 
-# --- 3. 데이터 모델 ---
 class PointRequest(BaseModel):
     email: str
 
@@ -81,12 +78,11 @@ class GenerateRequest(BaseModel):
     user_email: str
     cost: int
     url: Optional[str] = None
+    brand: Optional[str] = None
     topic: Optional[str] = None
     keyword: str
     channel: str
     image_count: int
-
-# --- 4. 엔드포인트 ---
 
 @app.get("/")
 def read_root():
@@ -115,7 +111,7 @@ def generate_content(req: GenerateRequest):
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1. 포인트 차감 처리 (구글 시트 연동)
+    # 1. 포인트 차감
     remaining_point = 0
     try:
         gc = get_gspread_client()
@@ -127,13 +123,13 @@ def generate_content(req: GenerateRequest):
                 remaining_point = max(0, current_p - req.cost)
                 sheet.update_cell(cell.row, 2, remaining_point)
             
-            # 장부 기록 (블로그넷_포인트장부 시트가 있을 경우 기록)
             try:
                 log_sheet = gc.open("블로그넷_포인트장부").sheet1
+                brand_info = f"[{req.brand}] " if req.brand else ""
                 log_sheet.append_row([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     req.user_email,
-                    f"원고 생성 ({req.keyword})",
+                    f"원고 생성 ({brand_info}{req.keyword})",
                     -req.cost,
                     remaining_point
                 ])
@@ -142,7 +138,7 @@ def generate_content(req: GenerateRequest):
     except Exception as e:
         print(f"포인트 차감 에러: {e}")
 
-    # 2. 레퍼런스 크롤링
+    # 2. URL 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         try:
@@ -158,26 +154,32 @@ def generate_content(req: GenerateRequest):
         except Exception as e:
             reference_text = f"URL 참조 내용 없음 ({str(e)})"
 
-    # 3. AI 원고 생성
+    # 3. AI 프롬프트 구성 (업체명 필수 강조)
     channel_prompts = {
         "blog_info": "전문적이고 신뢰도 높은 네이버 블로그 정보성 포스팅 어조",
-        "blog_review": "직접 체험하고 작성한 듯한 자연스럽고 생생한 블로그 후기 어조",
-        "cafe": "네이버 카페 침투 마케팅용 일상적이고 자연스러운 추천 질문/답변 어조",
-        "insta": "인스타그램 피드용 트렌디하고 감성적인 줄글과 핵심 해시태그 어조"
+        "blog_review": "직접 방문/이용하고 작성한 듯한 자연스럽고 생생한 솔직 후기 어조",
+        "cafe": "맘카페/지역 커뮤니티용 일상적이고 자연스러운 추천 글/답변 어조",
+        "insta": "인스타그램 피드용 트렌디하고 감성적인 줄글과 해시태그 어조"
     }
     tone = channel_prompts.get(req.channel, "자연스러운 블로그 포스팅 어조")
 
+    brand_section = f"홍보 타겟 업체명: '{req.brand}' (★매우 중요: 제목 및 본문 전체에 브랜드명/상호명을 핵심으로 강조하여 자연스럽게 반복 언급)" if req.brand else ""
+
     system_prompt = f"""
-    당신은 대한민국 최고의 바이럴 마케팅 전문 작가입니다.
+    당신은 대한민국 최고의 1타 바이럴 마케팅 전문 작가입니다.
     선택된 채널/스타일: {tone}
-    타겟 메인 키워드: '{req.keyword}' (제목 및 본문에 4~6회 자연스럽게 녹여낼 것)
-    추가 요청 내용: {req.topic if req.topic else '키워드 맞춤형 고품질 포스팅 작성'}
+    타겟 메인 키워드: '{req.keyword}'
+    {brand_section}
+    상세 특징 및 안내사항: {req.topic if req.topic else '키워드와 상호명을 부각한 고품질 포스팅 작성'}
     참고 레퍼런스: {reference_text if reference_text else '없음'}
 
-    [작성 가이드]
-    1. 제목은 사람들의 클릭을 유도하는 매력적인 헤드라인으로 뽑아주세요.
-    2. 본문은 소제목(###), 문단 나누기, 이모지를 적절히 사용하여 가독성 높게 작성해 주세요.
-    3. 네이버/인스타 검색 최적화(SEO)를 고려해 풍부한 분량(최소 1,000자 이상)으로 작성해 주세요.
+    [원고 작성 필수 지침]
+    1. 제목: 타겟 키워드와 업체명({req.brand or '업체'})이 매끄럽게 어우러진 시선 집중 클릭 유도형 헤드라인
+    2. 본문:
+       - 업체명/상호명을 주요 포인트마다 자연스럽게 4~6회 이상 노출
+       - 소제목(###), 문단 분리, 이모지를 적극 활용해 가독성 최적화
+       - 실제 이용자가 느끼는 장점, 방문 팁, 추천 이유를 1,000자 이상 풍부하게 구성
+    3. 하단: 타겟 키워드 및 상호명 관련 추천 해시태그 5~10개 제공
     """
 
     try:
@@ -185,12 +187,12 @@ def generate_content(req: GenerateRequest):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"키워드 '{req.keyword}'에 맞춰 실제 업로드 가능한 완벽한 원고를 작성해줘."}
+                {"role": "user", "content": f"업체명 '{req.brand or ''}', 키워드 '{req.keyword}'에 맞춰 완성도 높은 마케팅 원고를 작성해줘."}
             ]
         )
         content = completion.choices[0].message.content
     except Exception as e:
-        content = f"[{req.keyword}] 원고 생성 중 API 응답 오류 발생: {str(e)}\n\nAPI 키 크레딧 및 상태를 확인해 주세요."
+        content = f"[{req.brand or ''} / {req.keyword}] 원고 생성 중 오류 발생: {str(e)}"
 
     txt_path = os.path.join(task_dir, "원고.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
@@ -201,9 +203,10 @@ def generate_content(req: GenerateRequest):
     if req.image_count > 0:
         for i in range(req.image_count):
             try:
+                img_prompt = f"A clean, aesthetic commercial photo for {req.brand or req.keyword}, high quality photography, professional lighting"
                 img_resp = client.images.generate(
                     model="dall-e-3",
-                    prompt=f"A clean, aesthetic marketing photo for {req.keyword}, commercial photography, high quality",
+                    prompt=img_prompt,
                     size="1024x1024",
                     n=1
                 )
@@ -215,9 +218,10 @@ def generate_content(req: GenerateRequest):
                 pass
 
     # 5. 메타데이터 저장
+    title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
     meta = {
         "task_id": task_id,
-        "title": f"[{req.keyword}] 마케팅 원고",
+        "title": title_text,
         "email": req.user_email,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "image_count": images_created
