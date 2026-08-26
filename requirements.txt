@@ -6,3 +6,4 @@ python-dotenv
 gspread
 google-auth
 beautifulsoup4
+oauth2client
