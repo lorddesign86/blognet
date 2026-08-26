@@ -85,14 +85,11 @@ class GenerateRequest(BaseModel):
     channel: str
     image_count: int
 
-# --- 네이버 블로그 스마트 크롤러 ---
 def crawl_naver_blog(url: str) -> str:
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        
-        # 1. 네이버 블로그 URL을 모바일 URL 형태로 변환 (iframe 우회 및 파싱 최적화)
         target_url = url
         blog_id_match = re.search(r"blog\.naver\.com/([^/?&]+)/(\d+)", url)
         if blog_id_match:
@@ -102,13 +99,10 @@ def crawl_naver_blog(url: str) -> str:
         resp = requests.get(target_url, headers=headers, timeout=8)
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 모바일 스마트에디터 영역 파싱
         main_content = soup.find("div", class_=re.compile(r"(se-main-container|se_component_wrap|post_ct)"))
         if main_content:
-            text = main_content.get_text(separator="\n", strip=True)
-            return text[:4000]
+            return main_content.get_text(separator="\n", strip=True)[:4000]
 
-        # PC형 iframe 구조인 경우 재시도
         main_frame = soup.find("iframe", id="mainFrame")
         if main_frame:
             frame_url = "https://blog.naver.com" + main_frame["src"]
@@ -120,14 +114,20 @@ def crawl_naver_blog(url: str) -> str:
     except Exception as e:
         return f"레퍼런스 본문 추출 실패: {str(e)}"
 
-# --- 텍스트 정제 (특수문자 마크다운 제거) ---
+# 특수문자 정제 (해시태그 #은 그대로 유지)
 def clean_markdown_text(text: str) -> str:
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"###\s*", "■ ", text)
     text = re.sub(r"##\s*", "■ ", text)
-    text = re.sub(r"#\s*", "■ ", text)
     text = re.sub(r"---", "", text)
-    return text.strip()
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        if line.startswith("# ") and not line.startswith("#"):
+            cleaned_lines.append(line[2:])
+        else:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 @app.get("/")
 def read_root():
@@ -163,13 +163,13 @@ def generate_content(req: GenerateRequest):
 
     # 2. 프롬프트 세팅
     channel_prompts = {
-        "blog_info": "신뢰성과 전문성을 주는 네이버 블로그 정보성 포스팅 (친절하고 정중한 어조)",
-        "blog_review": "직접 방문해보고 추천하는 솔직하고 생생한 네이버 블로그 내돈내산 스타일 후기 어조",
-        "cafe": "맘카페/지역 커뮤니티에서 자연스럽게 정보를 공유하고 칭찬하는 일상 추천 어조",
-        "insta": "인스타그램 피드용 감성적인 톤앤매너와 핵심 요약, 해시태그 중심"
+        "blog_info": "전문적이고 신뢰도 높은 네이버 블로그 정보성 포스팅 어조",
+        "blog_review": "직접 체험/방문하고 작성한 듯한 자연스럽고 생생한 솔직 후기 어조",
+        "cafe": "맘카페/지역 커뮤니티용 일상적이고 자연스러운 추천 글/답변 어조",
+        "insta": "인스타그램 피드용 감성적인 줄글과 해시태그 어조"
     }
     tone = channel_prompts.get(req.channel, "자연스러운 네이버 블로그 포스팅")
-    brand_section = f"★ 홍보 대상 업체명(상호명): '{req.brand}'" if req.brand else ""
+    brand_section = f"★ 홍보 대상 업체명(상호명): '{req.brand}' (본문 전반에 4~6회 이상 자연스럽게 강조)" if req.brand else ""
 
     system_prompt = f"""
     당신은 대한민국 1위 바이럴 마케팅 전문 원고 작가입니다.
@@ -184,19 +184,16 @@ def generate_content(req: GenerateRequest):
     \"\"\"
 
     [필수 작성 규칙 - 엄격 준수]
-    1. 마크다운 특수문자 절대 금지:
-       - '**', '###', '##', '---' 같은 마크다운 기호를 절대 쓰지 마세요.
-       - 소제목은 '■ 소제목' 또는 '[ 소제목 ]' 형태로만 깔끔하게 작성하세요.
-    2. 분량 및 구성:
-       - 공백 제외 순수 한글 1,500자 이상의 매우 풍부하고 디테일한 분량으로 작성하세요.
-       - 가독성을 위해 문단과 문단 사이에 엔터(줄바꿈)를 2번씩 넣어 쾌적하게 구성하세요.
-    3. 본문 구성:
-       - 제목: 사람들의 클릭을 부르는 매력적인 헤드라인 (1줄)
-       - 도입부: 일상적인 공감대 형성 및 방문/이용 계기 소개
-       - 매장/서비스 정보: 위치, 인테리어 분위기, 이용 꿀팁 등 디테일한 설명
-       - 메인 특장점: 대표 메뉴(또는 서비스)의 맛, 장점, 퀄리티를 아주 생생하게 묘사
-       - 방문 팁 & 종합 평: 주차, 예약 팁, 재방문 의사 등 긍정적 마무리
-       - 추천 해시태그: 하단에 #키워드 형태로 8~10개 제공
+    1. 제목 형식:
+       - 반드시 맨 첫 줄에 '제목: [ 클릭을 유도하는 매력적인 헤드라인 ]' 형식으로 작성하세요.
+    2. 마크다운 특수문자 금지:
+       - 본문에 '**', '###', '---' 같은 마크다운 기호를 절대 쓰지 마세요.
+       - 소제목은 '■ 소제목' 형태로만 깔끔하게 작성하세요.
+    3. 분량 및 구성:
+       - 공백 제외 순수 한글 1,500자 이상의 풍부한 분량으로 작성하세요.
+       - 문단과 문단 사이에는 빈 줄을 넣어 쾌적한 가독성을 제공하세요.
+    4. 하단 해시태그 형식:
+       - 본문 맨 끝에 반드시 #키워드 #업체명 형태로 8~10개의 해시태그를 작성하세요. (예: #을지로맛집 #명동케이갈비 #을지로회식)
     """
 
     try:
@@ -204,7 +201,7 @@ def generate_content(req: GenerateRequest):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"타겟 키워드 '{req.keyword}'와 업체 정보를 완벽히 반영하여 1,500자 이상의 고품질 원고를 작성해줘."}
+                {"role": "user", "content": f"키워드 '{req.keyword}'와 업체 정보를 완벽히 반영하여 1,500자 이상의 고품질 원고를 작성해줘."}
             ],
             temperature=0.7
         )
@@ -217,12 +214,12 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # 3. 이미지 생성
+    # 3. 이미지 생성 (최대 10장)
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
             try:
-                img_prompt = f"A clean, realistic, aesthetic commercial photo for {req.brand or req.keyword}, high quality photography, appetizing food or interior view"
+                img_prompt = f"A clean, realistic, aesthetic photo for {req.brand or req.keyword}, commercial photography, appetizing or attractive interior"
                 img_resp = client.images.generate(
                     model="dall-e-3",
                     prompt=img_prompt,
@@ -236,7 +233,7 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 4. 구글 시트 포인트 차감 및 영구 기록
+    # 4. 구글 시트 포인트 차감 및 영구 누적 저장
     remaining_point = 0
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
@@ -264,6 +261,7 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
+            # 보관함에 계속 누적 저장
             try:
                 hist_sheet = gc.open("블로그넷_원고보관함").sheet1
                 hist_sheet.append_row([
@@ -298,6 +296,7 @@ def generate_content(req: GenerateRequest):
 @app.get("/api/history/{user_email}")
 def get_user_history(user_email: str):
     history = []
+    # 구글 시트에서 전체 히스토리 영구 로드 (제한 없이 누적)
     try:
         gc = get_gspread_client()
         if gc:
@@ -328,7 +327,7 @@ def get_user_history(user_email: str):
                     pass
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
 
-    return {"history": history[:30]}
+    return {"history": history}
 
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
