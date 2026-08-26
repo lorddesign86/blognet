@@ -4,6 +4,7 @@ import uuid
 import zipfile
 import re
 import csv
+import traceback
 from io import BytesIO, StringIO
 from datetime import datetime
 from typing import Optional
@@ -31,6 +32,7 @@ class ForceCORSMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception as e:
+            traceback.print_exc()
             response = Response(content=json.dumps({"detail": str(e)}), status_code=500, media_type="application/json")
             
         response.headers["Access-Control-Allow-Origin"] = "*"
@@ -109,7 +111,7 @@ def crawl_naver_blog(url: str) -> str:
             blog_id, log_no = blog_id_match.group(1), blog_id_match.group(2)
             target_url = f"https://m.blog.naver.com/{blog_id}/{log_no}"
 
-        resp = requests.get(target_url, headers=headers, timeout=8)
+        resp = requests.get(target_url, headers=headers, timeout=6)
         soup = BeautifulSoup(resp.text, "html.parser")
 
         main_content = soup.find("div", class_=re.compile(r"(se-main-container|se_component_wrap|post_ct)"))
@@ -119,7 +121,7 @@ def crawl_naver_blog(url: str) -> str:
         main_frame = soup.find("iframe", id="mainFrame")
         if main_frame:
             frame_url = "https://blog.naver.com" + main_frame["src"]
-            resp2 = requests.get(frame_url, headers=headers, timeout=8)
+            resp2 = requests.get(frame_url, headers=headers, timeout=6)
             soup2 = BeautifulSoup(resp2.text, "html.parser")
             return soup2.get_text(separator="\n", strip=True)[:4000]
 
@@ -149,7 +151,7 @@ def read_root():
 def get_user_point(req: PointRequest):
     try:
         params = {"email": req.email.strip().lower(), "action": "get"}
-        resp = requests.get(GAS_WEBAPP_URL, params=params, timeout=15, allow_redirects=True)
+        resp = requests.get(GAS_WEBAPP_URL, params=params, timeout=10, allow_redirects=True)
         if resp.status_code == 200:
             data = resp.json()
             return {"point": int(data.get("point", 0)), "status": "success", "user": req.email}
@@ -165,9 +167,10 @@ def generate_content(req: GenerateRequest):
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
+    # 1. 포인트 확인
     current_p = 5000
     try:
-        resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=15, allow_redirects=True)
+        resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=8, allow_redirects=True)
         if resp.status_code == 200:
             current_p = int(resp.json().get("point", 5000))
     except Exception:
@@ -176,6 +179,7 @@ def generate_content(req: GenerateRequest):
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
 
+    # 2. 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         reference_text = crawl_naver_blog(req.url)
@@ -233,14 +237,13 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # ⭐️ 공식 DALL-E 3 실시간 이미지 생성
+    # 3. ⭐️ DALL-E 3 안전 이미지 생성 처리
     images_created = 0
     if req.image_count > 0:
+        target_subject = req.brand if req.brand else req.keyword
         for i in range(req.image_count):
             try:
-                subject_name = req.brand if req.brand else req.keyword
-                img_prompt = f"A professional, realistic commercial DSLR photo of {subject_name}, clean aesthetic composition, high resolution, 4k quality, natural lighting, absolutely no text, no letters."
-                
+                img_prompt = f"Professional clean aesthetic commercial DSLR photography of {target_subject}, natural daylight, 4k high quality, modern background, absolutely no text, no letters, no watermark"
                 img_resp = client.images.generate(
                     model="dall-e-3",
                     prompt=img_prompt,
@@ -249,16 +252,17 @@ def generate_content(req: GenerateRequest):
                     n=1
                 )
                 img_url = img_resp.data[0].url
-                img_data = requests.get(img_url, timeout=20).content
+                img_data = requests.get(img_url, timeout=25).content
                 with open(os.path.join(task_dir, f"image_{i+1}.jpg"), "wb") as f:
                     f.write(img_data)
                 images_created += 1
             except Exception as e:
-                print(f"[ERROR] 이미지 {i+1}번 DALL-E 3 생성 실패: {e}")
+                print(f"[ERROR] 이미지 {i+1}번 생성 실패 (건너뜀): {e}")
 
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
     channel_display = channel_labels.get(req.channel, "블로그")
 
+    # 4. 스프레드시트 차감 및 2번째 시트 기록
     remaining_point = max(0, current_p - req.cost)
     try:
         deduct_params = {
@@ -268,11 +272,11 @@ def generate_content(req: GenerateRequest):
             "title": title_text,
             "channel": channel_display
         }
-        d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=15, allow_redirects=True)
+        d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=8, allow_redirects=True)
         if d_resp.status_code == 200:
             remaining_point = int(d_resp.json().get("point", remaining_point))
     except Exception as e:
-        print(f"[ERROR] 차감/내역기록 실패: {e}")
+        print(f"[ERROR] 스프레드시트 연동 실패: {e}")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     meta = {
@@ -306,7 +310,6 @@ def download_result(task_id: str):
             return FileResponse(path=txt_path, filename="원고.txt", media_type="text/plain; charset=utf-8")
         raise HTTPException(status_code=404, detail="원고 파일이 없습니다.")
 
-    # 이미지가 있으면 이미지와 텍스트를 담은 ZIP 압축 파일 제공
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, "w") as zf:
         for root, _, files in os.walk(task_dir):
