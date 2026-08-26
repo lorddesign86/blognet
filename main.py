@@ -114,7 +114,6 @@ def crawl_naver_blog(url: str) -> str:
     except Exception as e:
         return f"레퍼런스 본문 추출 실패: {str(e)}"
 
-# 특수문자 정제 (해시태그 #은 그대로 유지)
 def clean_markdown_text(text: str) -> str:
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"###\s*", "■ ", text)
@@ -133,35 +132,59 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
+# 1. 포인트 실시간 조회 (블로그넷_회원관리 시트 연동)
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     try:
         gc = get_gspread_client()
         if gc:
-            try:
-                sheet = gc.open("블로그넷_회원관리").sheet1
-                cell = sheet.find(req.email)
-                if cell:
-                    point_val = sheet.cell(cell.row, 2).value
-                    return {"point": int(point_val)}
-            except Exception:
-                pass
-        return {"point": 5000}
+            sheet = gc.open("블로그넷_회원관리").sheet1
+            cell = sheet.find(req.email)
+            if cell:
+                point_val = sheet.cell(cell.row, 2).value  # B열: Current_point
+                return {"point": int(point_val or 0)}
+            else:
+                # 회원이 없으면 6,000P 기본 지급 및 행 추가
+                sheet.append_row([req.email, 6000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
+                return {"point": 6000}
+        return {"point": 0}
     except Exception as e:
-        return {"point": 5000, "error": str(e)}
+        return {"point": 0, "error": str(e)}
 
+# 2. 원고 생성 및 포인트 차감
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1. 레퍼런스 크롤링
+    # 포인트 검증
+    gc = get_gspread_client()
+    user_cell = None
+    current_p = 0
+    sheet = None
+
+    if gc:
+        try:
+            sheet = gc.open("블로그넷_회원관리").sheet1
+            user_cell = sheet.find(req.user_email)
+            if user_cell:
+                current_p = int(sheet.cell(user_cell.row, 2).value or 0)
+            else:
+                current_p = 6000
+                sheet.append_row([req.user_email, 6000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
+                user_cell = sheet.find(req.user_email)
+        except Exception:
+            current_p = 0
+
+    if current_p < req.cost:
+        raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
+
+    # 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         reference_text = crawl_naver_blog(req.url)
 
-    # 2. 프롬프트 세팅
     channel_prompts = {
         "blog_info": "전문적이고 신뢰도 높은 네이버 블로그 정보성 포스팅 어조",
         "blog_review": "직접 체험/방문하고 작성한 듯한 자연스럽고 생생한 솔직 후기 어조",
@@ -178,22 +201,16 @@ def generate_content(req: GenerateRequest):
     {brand_section}
     추가 안내사항: {req.topic if req.topic else '제공된 레퍼런스 및 키워드 기반 작성'}
 
-    [제공된 레퍼런스 본문 내용 (반드시 이 내용을 분석하여 매장 정보, 메뉴, 특장점을 반영할 것)]:
+    [제공된 레퍼런스 본문 내용]:
     \"\"\"
     {reference_text if reference_text else '레퍼런스 없음 (키워드 및 업체명 기반 창작)'}
     \"\"\"
 
     [필수 작성 규칙 - 엄격 준수]
-    1. 제목 형식:
-       - 반드시 맨 첫 줄에 '제목: [ 클릭을 유도하는 매력적인 헤드라인 ]' 형식으로 작성하세요.
-    2. 마크다운 특수문자 금지:
-       - 본문에 '**', '###', '---' 같은 마크다운 기호를 절대 쓰지 마세요.
-       - 소제목은 '■ 소제목' 형태로만 깔끔하게 작성하세요.
-    3. 분량 및 구성:
-       - 공백 제외 순수 한글 1,500자 이상의 풍부한 분량으로 작성하세요.
-       - 문단과 문단 사이에는 빈 줄을 넣어 쾌적한 가독성을 제공하세요.
-    4. 하단 해시태그 형식:
-       - 본문 맨 끝에 반드시 #키워드 #업체명 형태로 8~10개의 해시태그를 작성하세요. (예: #을지로맛집 #명동케이갈비 #을지로회식)
+    1. 제목 형식: 반드시 맨 첫 줄에 '제목: [ 클릭을 유도하는 매력적인 헤드라인 ]' 형식으로 작성
+    2. 마크다운 특수문자 금지: '**', '###', '---' 사용 금지, 소제목은 '■ 소제목' 형태 사용
+    3. 분량: 공백 제외 순수 한글 1,500자 이상 및 가독성을 위한 문단별 줄바꿈 2회
+    4. 하단 해시태그: 맨 끝에 #키워드 #업체명 형태로 8~10개 제공
     """
 
     try:
@@ -214,12 +231,12 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # 3. 이미지 생성 (최대 10장)
+    # 이미지 생성 (최대 10장)
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
             try:
-                img_prompt = f"A clean, realistic, aesthetic photo for {req.brand or req.keyword}, commercial photography, appetizing or attractive interior"
+                img_prompt = f"A clean, realistic, aesthetic photo for {req.brand or req.keyword}, commercial photography, high quality"
                 img_resp = client.images.generate(
                     model="dall-e-3",
                     prompt=img_prompt,
@@ -233,47 +250,19 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 4. 구글 시트 포인트 차감 및 영구 누적 저장
-    remaining_point = 0
+    # 구글 시트 포인트 차감 및 갱신
+    remaining_point = max(0, current_p - req.cost)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
 
     try:
-        gc = get_gspread_client()
-        if gc:
-            sheet = gc.open("블로그넷_회원관리").sheet1
-            cell = sheet.find(req.user_email)
-            if cell:
-                current_p = int(sheet.cell(cell.row, 2).value or 0)
-                remaining_point = max(0, current_p - req.cost)
-                sheet.update_cell(cell.row, 2, remaining_point)
+        if gc and sheet and user_cell:
+            sheet.update_cell(user_cell.row, 2, remaining_point)  # B열: 잔여 포인트 차감
             
-            try:
-                log_sheet = gc.open("블로그넷_포인트장부").sheet1
-                brand_info = f"[{req.brand}] " if req.brand else ""
-                log_sheet.append_row([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    req.user_email,
-                    f"원고 생성 ({brand_info}{req.keyword})",
-                    -req.cost,
-                    remaining_point
-                ])
-            except Exception:
-                pass
-
-            # 보관함에 계속 누적 저장
-            try:
-                hist_sheet = gc.open("블로그넷_원고보관함").sheet1
-                hist_sheet.append_row([
-                    task_id,
-                    req.user_email,
-                    title_text,
-                    images_created,
-                    now_str,
-                    content[:500]
-                ])
-            except Exception:
-                pass
+            # C열: 누적 사용량
+            prev_used = int(sheet.cell(user_cell.row, 3).value or 0)
+            sheet.update_cell(user_cell.row, 3, prev_used + req.cost)
+            sheet.update_cell(user_cell.row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as e:
         print(f"구글 시트 연동 에러: {e}")
 
@@ -296,25 +285,7 @@ def generate_content(req: GenerateRequest):
 @app.get("/api/history/{user_email}")
 def get_user_history(user_email: str):
     history = []
-    # 구글 시트에서 전체 히스토리 영구 로드 (제한 없이 누적)
-    try:
-        gc = get_gspread_client()
-        if gc:
-            hist_sheet = gc.open("블로그넷_원고보관함").sheet1
-            records = hist_sheet.get_all_values()
-            for row in reversed(records[1:]):
-                if len(row) >= 5 and row[1] == user_email:
-                    history.append({
-                        "task_id": row[0],
-                        "email": row[1],
-                        "title": row[2],
-                        "image_count": int(row[3] or 0),
-                        "created_at": row[4]
-                    })
-    except Exception:
-        pass
-
-    if not history and os.path.exists(STORAGE_DIR):
+    if os.path.exists(STORAGE_DIR):
         for t_id in os.listdir(STORAGE_DIR):
             meta_path = os.path.join(STORAGE_DIR, t_id, "meta.json")
             if os.path.exists(meta_path):
@@ -326,7 +297,6 @@ def get_user_history(user_email: str):
                 except Exception:
                     pass
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-
     return {"history": history}
 
 @app.get("/api/download/{task_id}")
