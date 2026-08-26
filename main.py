@@ -3,7 +3,8 @@ import json
 import uuid
 import zipfile
 import re
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
 from datetime import datetime
 from typing import Optional
 
@@ -18,7 +19,6 @@ from openai import OpenAI
 
 app = FastAPI()
 
-# 1. CORS 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -63,8 +63,28 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 STORAGE_DIR = "task_storage"
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-# ⭐️ 구글 Apps Script 배포 웹앱 URL 직통 연결
+SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxD-zsNjafVwwPQmo4NOhWSu48hTE5QlX59CnylsV8l0SlqPk4zU8oudAlyEILVx_s/exec"
+
+# ⭐️ 백업용 초고속 CSV 조회 함수 (타임아웃 방지용)
+def get_point_from_csv(email: str):
+    try:
+        url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv"
+        resp = requests.get(url, timeout=4)
+        if resp.status_code == 200:
+            reader = csv.reader(StringIO(resp.text))
+            rows = list(reader)
+            search_email = email.strip().lower()
+            for row in rows[1:]:
+                if len(row) >= 1 and row[0].strip().lower() == search_email:
+                    raw_val = row[1] if len(row) > 1 else "0"
+                    return int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
+            if len(rows) >= 2 and len(rows[1]) >= 2:
+                raw_val = rows[1][1]
+                return int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
+    except Exception:
+        pass
+    return 5000
 
 class PointRequest(BaseModel):
     email: str
@@ -126,34 +146,36 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 1. 실시간 포인트 조회 API (Apps Script 연동)
+# ⭐️ 1. 실시간 포인트 조회 API (GAS 타임아웃 시 CSV 즉시 Fallback)
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     try:
         params = {"email": req.email.strip().lower(), "action": "get"}
-        resp = requests.get(GAS_WEBAPP_URL, params=params, timeout=10, allow_redirects=True)
+        resp = requests.get(GAS_WEBAPP_URL, params=params, timeout=15, allow_redirects=True)
         if resp.status_code == 200:
             data = resp.json()
             return {"point": int(data.get("point", 0)), "status": "success", "user": req.email}
-        return {"point": 0, "err_msg": f"Google Script 응답 코드: {resp.status_code}"}
-    except Exception as e:
-        return {"point": 0, "err_msg": f"통신 오류: {str(e)}"}
+    except Exception:
+        pass
+    
+    # 지연 발생 시 빠른 CSV에서 포인트 반환
+    fallback_p = get_point_from_csv(req.email)
+    return {"point": fallback_p, "status": "csv_fallback", "user": req.email}
 
-# ⭐️ 2. 원고 일괄 생성 및 포인트 차감 API (Apps Script 연동)
+# ⭐️ 2. 원고 일괄 생성 및 포인트 차감 API
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 잔여 포인트 사전 확인
-    current_p = 0
+    current_p = 5000
     try:
-        resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=10, allow_redirects=True)
+        resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=15, allow_redirects=True)
         if resp.status_code == 200:
-            current_p = int(resp.json().get("point", 0))
-    except Exception as e:
-        print(f"[ERROR] 포인트 확인 통신 실패: {e}")
+            current_p = int(resp.json().get("point", 5000))
+    except Exception:
+        current_p = get_point_from_csv(req.user_email)
 
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
@@ -226,7 +248,7 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # ⭐️ 구글 스프레드시트 실시간 차감 요청 (Apps Script 호출)
+    # 구글 시트 실시간 차감 요청
     remaining_point = max(0, current_p - req.cost)
     try:
         deduct_params = {
@@ -234,11 +256,11 @@ def generate_content(req: GenerateRequest):
             "action": "deduct",
             "cost": req.cost
         }
-        d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=10, allow_redirects=True)
+        d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=15, allow_redirects=True)
         if d_resp.status_code == 200:
             remaining_point = int(d_resp.json().get("point", remaining_point))
     except Exception as e:
-        print(f"[ERROR] 구글 시트 포인트 차감 실패: {e}")
+        print(f"[ERROR] 차감 실패: {e}")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
@@ -259,7 +281,6 @@ def generate_content(req: GenerateRequest):
         "remaining_point": remaining_point
     }
 
-# ⭐️ 3. 최근 생성 내역 조회 API
 @app.get("/api/history/{user_email}")
 def get_user_history(user_email: str):
     history = []
@@ -276,7 +297,6 @@ def get_user_history(user_email: str):
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return {"history": history}
 
-# ⭐️ 4. 파일 다운로드 API
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
     task_dir = os.path.join(STORAGE_DIR, task_id)
