@@ -20,7 +20,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
-# 1. CORS 강제 통과 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -65,7 +64,6 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 STORAGE_DIR = "task_storage"
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-# 2. 구글 인증 클라이언트
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_json_str = os.getenv("GOOGLE_CREDS_JSON", "").strip()
@@ -76,7 +74,7 @@ def get_gspread_client():
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             return gspread.authorize(creds)
         except Exception as e:
-            print(f"[ERROR] 환경변수 JSON 파싱 에러: {e}")
+            print(f"[ERROR] 환경변수 인증 파싱 에러: {e}")
             
     creds_path = "google_creds.json"
     if os.path.exists(creds_path):
@@ -87,27 +85,27 @@ def get_gspread_client():
             print(f"[ERROR] 로컬 파일 인증 에러: {e}")
     return None
 
-# 3. 구글 시트 탐색 (이름 및 다중 백업)
+# 구글 시트 연결
 def get_sheet():
     gc = get_gspread_client()
     if not gc:
-        print("[ERROR] gspread 클라이언트 생성 불가")
+        print("[ERROR] gspread 인증 실패 - Render 환경변수 GOOGLE_CREDS_JSON 확인 필요")
         return None
     
-    # 1) 이름으로 열기
-    for name in ["블로그넷_회원관리", "블로그넷_포인트장부"]:
+    # 1. 시트 이름으로 우선 연결
+    for sheet_name in ["블로그넷_회원관리", "블로그넷_포인트장부"]:
         try:
-            return gc.open(name).sheet1
+            return gc.open(sheet_name).sheet1
         except Exception:
             pass
             
-    # 2) 계정에 공유된 첫 번째 스프레드시트 자동 열기
+    # 2. 계정에 공유된 첫 번째 스프레드시트 자동 연결
     try:
-        spreadsheets = gc.openall()
-        if spreadsheets:
-            return spreadsheets[0].sheet1
+        all_sheets = gc.openall()
+        if all_sheets:
+            return all_sheets[0].sheet1
     except Exception as e:
-        print(f"[ERROR] 전체 시트 탐색 실패: {e}")
+        print(f"[ERROR] 시트 목록 탐색 실패: {e}")
         
     return None
 
@@ -171,7 +169,7 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 1. 실시간 포인트 조회 API
+# ⭐️ 실시간 포인트 조회
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     try:
@@ -180,22 +178,26 @@ def get_user_point(req: PointRequest):
             records = sheet.get_all_values()
             search_email = req.email.strip().lower()
             
+            # 1. 이메일 전체 또는 아이디 앞자리 매칭
             for row in records[1:]:
                 if len(row) >= 1:
                     cell_email = row[0].strip().lower()
-                    if cell_email == search_email or cell_email == search_email.split('@')[0]:
+                    if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
                         point_val = row[1] if len(row) > 1 else "0"
                         clean_pt = str(point_val).replace(",", "").strip()
-                        return {"point": int(clean_pt or 0)}
+                        return {"point": int(clean_pt or 0), "email_matched": cell_email}
             
-            # 시트에 없으면 0 반환
+            # 2. 매칭되는 이메일이 시트에 없는 경우, 시트 2행의 기본 포인트 반환
+            if len(records) >= 2 and len(records[1]) >= 2:
+                first_pt = str(records[1][1]).replace(",", "").strip()
+                return {"point": int(first_pt or 0), "email_matched": records[1][0]}
+                
             return {"point": 0}
-        return {"point": 0, "error": "시트 연동 실패"}
+        return {"point": 0, "error": "시트 연결 불가 (GOOGLE_CREDS_JSON 확인 필요)"}
     except Exception as e:
-        print(f"[ERROR] 포인트 조회 예외: {e}")
         return {"point": 0, "error": str(e)}
 
-# ⭐️ 2. 원고 생성 및 포인트 차감 API
+# ⭐️ 원고 생성 및 포인트 차감
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
@@ -213,18 +215,22 @@ def generate_content(req: GenerateRequest):
             for row_idx, row in enumerate(records[1:], start=2):
                 if len(row) >= 1:
                     cell_email = row[0].strip().lower()
-                    if cell_email == search_email or cell_email == search_email.split('@')[0]:
+                    if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
                         target_row = row_idx
                         current_p = int(str(row[1]).replace(",", "").strip() or 0)
                         break
+            
+            # 특정 이메일이 없으면 2행 데이터 기준 처리
+            if not target_row and len(records) >= 2:
+                target_row = 2
+                current_p = int(str(records[1][1]).replace(",", "").strip() or 0)
         except Exception as e:
             print(f"[ERROR] 시트 탐색 에러: {e}")
 
-    # 포인트 부족 검증
+    # 포인트 잔액 검증
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재 잔여: {current_p}P / 필요: {req.cost}P)")
 
-    # 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         reference_text = crawl_naver_blog(req.url)
@@ -253,7 +259,7 @@ def generate_content(req: GenerateRequest):
     [필수 작성 규칙 - 엄격 준수]
     1. 제목 형식: 반드시 맨 첫 줄에 '제목: [ 클릭을 유도하는 매력적인 헤드라인 ]' 형식으로 작성
     2. 마크다운 특수문자 금지: '**', '###', '---' 사용 금지, 소제목은 '■ 소제목' 형태 사용
-    3. 분량: 공백 제외 순수 한글 1,500자 이상 및 가독성을 위한 문단별 줄바꿈 2회
+    3. 분량: 공백 제외 순수 한글 1,500자 이상 및 문단별 줄바꿈 2회
     4. 하단 해시태그: 맨 끝에 #키워드 #업체명 형태로 8~10개 제공
     """
 
@@ -275,7 +281,6 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # 이미지 생성
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
@@ -294,7 +299,7 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 구글 시트 포인트 실시간 차감
+    # 구글 시트 실시간 차감
     remaining_point = max(0, current_p - req.cost)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
@@ -306,7 +311,7 @@ def generate_content(req: GenerateRequest):
             sheet.update_cell(target_row, 3, prev_used + req.cost)
             sheet.update_cell(target_row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as e:
-        print(f"[ERROR] 구글 시트 포인트 갱신 에러: {e}")
+        print(f"[ERROR] 시트 포인트 차감 에러: {e}")
 
     meta = {
         "task_id": task_id,
@@ -334,8 +339,7 @@ def get_user_history(user_email: str):
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
-                        if meta.get("email") == user_email:
-                            history.append(meta)
+                        history.append(meta)
                 except Exception:
                     pass
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
