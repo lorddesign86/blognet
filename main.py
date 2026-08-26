@@ -20,6 +20,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
+# 1. CORS 강제 통과 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -64,13 +65,41 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 STORAGE_DIR = "task_storage"
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
+# 2. 구글 인증 클라이언트 (철저한 예외 방어)
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_json_str = os.getenv("GOOGLE_CREDS_JSON", "").strip()
+    
+    if creds_json_str:
+        try:
+            creds_dict = json.loads(creds_json_str)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            print(f"환경변수 JSON 파싱 에러: {e}")
+            
     creds_path = "google_creds.json"
     if os.path.exists(creds_path):
-        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-        return gspread.authorize(creds)
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            print(f"로컬 파일 인증 에러: {e}")
     return None
+
+def get_sheet():
+    gc = get_gspread_client()
+    if not gc:
+        return None
+    try:
+        # 1순위: 시트 이름으로 탐색
+        return gc.open("블로그넷_회원관리").sheet1
+    except Exception:
+        try:
+            # 2순위: 다른 이름 fallback
+            return gc.open("블로그넷_포인트장부").sheet1
+        except Exception:
+            return None
 
 class PointRequest(BaseModel):
     email: str
@@ -132,59 +161,64 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# 1. 포인트 실시간 조회 (블로그넷_회원관리 시트 연동)
+# 1. 포인트 조회 엔드포인트
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     try:
-        gc = get_gspread_client()
-        if gc:
-            sheet = gc.open("블로그넷_회원관리").sheet1
-            cell = sheet.find(req.email)
-            if cell:
-                point_val = sheet.cell(cell.row, 2).value  # B열: Current_point
-                return {"point": int(point_val or 0)}
-            else:
-                # 회원이 없으면 6,000P 기본 지급 및 행 추가
-                sheet.append_row([req.email, 6000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
-                return {"point": 6000}
-        return {"point": 0}
+        sheet = get_sheet()
+        if sheet:
+            records = sheet.get_all_values()
+            search_email = req.email.strip().lower()
+            
+            for row_idx, row in enumerate(records[1:], start=2):
+                if len(row) >= 1 and (row[0].strip().lower() == search_email or row[0].strip().lower() == search_email.split('@')[0]):
+                    point_val = row[1] if len(row) > 1 else "0"
+                    clean_pt = str(point_val).replace(",", "").strip()
+                    return {"point": int(clean_pt or 0)}
+            
+            # 없으면 시트에 자동 생성
+            sheet.append_row([req.email, 50000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
+            return {"point": 50000}
+        return {"point": 50000}
     except Exception as e:
-        return {"point": 0, "error": str(e)}
+        print(f"포인트 조회 실패: {e}")
+        return {"point": 50000}
 
-# 2. 원고 생성 및 포인트 차감
+# 2. 원고 생성 엔드포인트
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 포인트 검증
-    gc = get_gspread_client()
-    user_cell = None
-    current_p = 0
-    sheet = None
+    # 1) 포인트 조회 및 검증
+    sheet = get_sheet()
+    target_row = None
+    current_p = 50000
+    search_email = req.user_email.strip().lower()
 
-    if gc:
+    if sheet:
         try:
-            sheet = gc.open("블로그넷_회원관리").sheet1
-            user_cell = sheet.find(req.user_email)
-            if user_cell:
-                current_p = int(sheet.cell(user_cell.row, 2).value or 0)
-            else:
-                current_p = 6000
-                sheet.append_row([req.user_email, 6000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
-                user_cell = sheet.find(req.user_email)
-        except Exception:
-            current_p = 0
+            records = sheet.get_all_values()
+            for row_idx, row in enumerate(records[1:], start=2):
+                if len(row) >= 1 and (row[0].strip().lower() == search_email or row[0].strip().lower() == search_email.split('@')[0]):
+                    target_row = row_idx
+                    current_p = int(str(row[1]).replace(",", "").strip() or 0)
+                    break
+            
+            if not target_row:
+                sheet.append_row([req.user_email, 50000, 0, datetime.now().strftime("%Y-%m-%d %H:%M")])
+                target_row = len(records) + 1
+                current_p = 50000
+        except Exception as e:
+            print(f"시트 탐색 에러: {e}")
 
-    if current_p < req.cost:
-        raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
-
-    # 레퍼런스 크롤링
+    # 2) 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         reference_text = crawl_naver_blog(req.url)
 
+    # 3) 프롬프트 세팅
     channel_prompts = {
         "blog_info": "전문적이고 신뢰도 높은 네이버 블로그 정보성 포스팅 어조",
         "blog_review": "직접 체험/방문하고 작성한 듯한 자연스럽고 생생한 솔직 후기 어조",
@@ -209,7 +243,7 @@ def generate_content(req: GenerateRequest):
     [필수 작성 규칙 - 엄격 준수]
     1. 제목 형식: 반드시 맨 첫 줄에 '제목: [ 클릭을 유도하는 매력적인 헤드라인 ]' 형식으로 작성
     2. 마크다운 특수문자 금지: '**', '###', '---' 사용 금지, 소제목은 '■ 소제목' 형태 사용
-    3. 분량: 공백 제외 순수 한글 1,500자 이상 및 가독성을 위한 문단별 줄바꿈 2회
+    3. 분량: 공백 제외 순수 한글 1,500자 이상 및 문단별 줄바꿈 2회
     4. 하단 해시태그: 맨 끝에 #키워드 #업체명 형태로 8~10개 제공
     """
 
@@ -231,7 +265,7 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # 이미지 생성 (최대 10장)
+    # 4) 이미지 생성
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
@@ -250,21 +284,19 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 구글 시트 포인트 차감 및 갱신
+    # 5) 시트 차감 갱신
     remaining_point = max(0, current_p - req.cost)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
 
     try:
-        if gc and sheet and user_cell:
-            sheet.update_cell(user_cell.row, 2, remaining_point)  # B열: 잔여 포인트 차감
-            
-            # C열: 누적 사용량
-            prev_used = int(sheet.cell(user_cell.row, 3).value or 0)
-            sheet.update_cell(user_cell.row, 3, prev_used + req.cost)
-            sheet.update_cell(user_cell.row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if sheet and target_row:
+            sheet.update_cell(target_row, 2, remaining_point)
+            prev_used = int(str(sheet.cell(target_row, 3).value or 0).replace(",", "").strip() or 0)
+            sheet.update_cell(target_row, 3, prev_used + req.cost)
+            sheet.update_cell(target_row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as e:
-        print(f"구글 시트 연동 에러: {e}")
+        print(f"구글 시트 포인트 갱신 에러: {e}")
 
     meta = {
         "task_id": task_id,
