@@ -227,34 +227,36 @@ def generate_content(req: GenerateRequest):
         raw_content = completion.choices[0].message.content
         content = clean_markdown_text(raw_content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OpenAI 원고 생성 실패: {str(e)}")
 
     txt_path = os.path.join(task_dir, "원고.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
+    # ⭐️ 이미지 생성 처리
     images_created = 0
     if req.image_count > 0:
         for i in range(req.image_count):
             try:
-                img_prompt = f"A clean, realistic, aesthetic commercial photo for {req.brand or req.keyword}, high quality photography"
+                img_prompt = f"Professional clean aesthetic commercial photography of {req.brand or req.keyword}, photo taken with DSLR, natural lighting, high quality, realistic, no text"
+                # 빠르고 안정적인 DALL-E 이미지 생성
                 img_resp = client.images.generate(
-                    model="dall-e-3",
-                    prompt=img_prompt,
-                    size="1024x1024",
+                    model="dall-e-2",
+                    prompt=img_prompt[:950],
+                    size="512x512",
                     n=1
                 )
-                img_data = requests.get(img_resp.data[0].url).content
+                img_url = img_resp.data[0].url
+                img_data = requests.get(img_url, timeout=15).content
                 with open(os.path.join(task_dir, f"image_{i+1}.jpg"), "wb") as f:
                     f.write(img_data)
                 images_created += 1
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ERROR] 이미지 {i+1}번 생성 실패: {e}")
 
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
     channel_display = channel_labels.get(req.channel, "블로그")
 
-    # ⭐️ 구글 시트 1번째 탭 차감 + 2번째 탭(사용내역)에 행 기록
     remaining_point = max(0, current_p - req.cost)
     try:
         deduct_params = {
@@ -284,24 +286,9 @@ def generate_content(req: GenerateRequest):
     return {
         "task_id": task_id,
         "content": content,
+        "image_count": images_created,
         "remaining_point": remaining_point
     }
-
-@app.get("/api/history/{user_email}")
-def get_user_history(user_email: str):
-    history = []
-    if os.path.exists(STORAGE_DIR):
-        for t_id in os.listdir(STORAGE_DIR):
-            meta_path = os.path.join(STORAGE_DIR, t_id, "meta.json")
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                        history.append(meta)
-                except Exception:
-                    pass
-        history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return {"history": history}
 
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
@@ -309,19 +296,16 @@ def download_result(task_id: str):
     if not os.path.exists(task_dir):
         raise HTTPException(status_code=404, detail="다운로드 대상이 존재하지 않습니다.")
 
-    meta_path = os.path.join(task_dir, "meta.json")
-    image_count = 0
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                image_count = json.load(f).get("image_count", 0)
-        except Exception:
-            pass
+    # 이미지 파일이 있는지 확인
+    jpg_files = [f for f in os.listdir(task_dir) if f.endswith(".jpg")]
 
-    if image_count == 0:
+    if len(jpg_files) == 0:
         txt_path = os.path.join(task_dir, "원고.txt")
-        return FileResponse(path=txt_path, filename=f"원고_{task_id[:8]}.txt", media_type="text/plain; charset=utf-8")
+        if os.path.exists(txt_path):
+            return FileResponse(path=txt_path, filename="원고.txt", media_type="text/plain; charset=utf-8")
+        raise HTTPException(status_code=404, detail="원고 파일이 없습니다.")
 
+    # 이미지가 1장 이상이면 ZIP 압축 파일로 제공
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, "w") as zf:
         for root, _, files in os.walk(task_dir):
