@@ -20,7 +20,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
-# 1. CORS 완전 허용
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -67,59 +66,33 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 
-# 2. 구글 서비스 계정 인증 (개행문자 자동 치환 방어)
 def get_gspread_client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets"
+    ]
     creds_raw = os.getenv("GOOGLE_CREDS_JSON", "").strip()
     
     if creds_raw:
         try:
-            # 환경변수에서 줄바꿈이 이스케이프된 경우 대응
             if "\\n" in creds_raw and "\n" not in creds_raw:
                 creds_raw = creds_raw.replace("\\n", "\n")
             creds_dict = json.loads(creds_raw)
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            return gspread.authorize(creds)
+            return gspread.authorize(creds), None
         except Exception as e:
-            print(f"[GOOGLE_AUTH_ERROR] 환경변수 파싱 실패: {e}")
+            return None, f"환경변수 파싱 실패: {str(e)}"
             
     creds_path = "google_creds.json"
     if os.path.exists(creds_path):
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-            return gspread.authorize(creds)
+            return gspread.authorize(creds), None
         except Exception as e:
-            print(f"[GOOGLE_AUTH_ERROR] 로컬 키파일 파싱 실패: {e}")
-    return None
-
-def get_sheet():
-    gc = get_gspread_client()
-    if not gc:
-        print("[ERROR] gspread 클라이언트 생성 실패")
-        return None
-    
-    # 1) ID로 직접 열기
-    try:
-        return gc.open_by_key(SPREADSHEET_ID).sheet1
-    except Exception as e:
-        print(f"[ERROR] open_by_key 실패: {e}")
-        
-    # 2) 이름으로 열기
-    for name in ["블로그넷_회원관리", "블로그넷_포인트장부"]:
-        try:
-            return gc.open(name).sheet1
-        except Exception:
-            pass
+            return None, f"로컬 파일 파싱 실패: {str(e)}"
             
-    # 3) 전체 중 첫 번째 시트
-    try:
-        sheets = gc.openall()
-        if sheets:
-            return sheets[0].sheet1
-    except Exception:
-        pass
-
-    return None
+    return None, "GOOGLE_CREDS_JSON 환경변수가 비어있습니다."
 
 class PointRequest(BaseModel):
     email: str
@@ -181,49 +154,55 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 실시간 포인트 조회 엔드포인트
+# ⭐️ 실시간 포인트 조회 API (정밀 에러 반환)
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
-    try:
-        sheet = get_sheet()
-        if sheet:
-            records = sheet.get_all_values()
-            search_email = req.email.strip().lower()
-            
-            # 1. 시트 A열과 매칭
-            for row in records[1:]:
-                if len(row) >= 1:
-                    cell_email = row[0].strip().lower()
-                    if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
-                        raw_val = row[1] if len(row) > 1 else "0"
-                        clean_num = re.sub(r"[^\d]", "", str(raw_val))
-                        return {"point": int(clean_num or 0), "status": "success", "user": cell_email}
-            
-            # 2. 이메일 매칭 실패 시 시트 2행 첫 번째 데이터 우선 사용
-            if len(records) >= 2 and len(records[1]) >= 2:
-                raw_val = records[1][1]
-                clean_num = re.sub(r"[^\d]", "", str(raw_val))
-                return {"point": int(clean_num or 0), "status": "fallback_row2", "user": records[1][0]}
-                
-            return {"point": 0, "status": "empty_sheet"}
-        return {"point": 0, "status": "error", "message": "Google Sheet not connected (Check GOOGLE_CREDS_JSON)"}
-    except Exception as e:
-        return {"point": 0, "status": "exception", "error": str(e)}
+    gc, auth_err = get_gspread_client()
+    if not gc:
+        return {"point": 0, "err_msg": f"인증 실패: {auth_err}"}
 
-# ⭐️ 원고 생성 및 포인트 차감
+    try:
+        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+    except Exception as e:
+        return {"point": 0, "err_msg": f"시트 접근 실패: {str(e)}"}
+
+    try:
+        records = sheet.get_all_values()
+        search_email = req.email.strip().lower()
+        
+        for row in records[1:]:
+            if len(row) >= 1:
+                cell_email = row[0].strip().lower()
+                if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
+                    raw_val = row[1] if len(row) > 1 else "0"
+                    clean_num = re.sub(r"[^\d]", "", str(raw_val))
+                    return {"point": int(clean_num or 0), "status": "success", "user": cell_email}
+        
+        if len(records) >= 2 and len(records[1]) >= 2:
+            raw_val = records[1][1]
+            clean_num = re.sub(r"[^\d]", "", str(raw_val))
+            return {"point": int(clean_num or 0), "status": "fallback_row2", "user": records[1][0]}
+
+        return {"point": 0, "err_msg": "시트에 데이터 없음"}
+    except Exception as e:
+        return {"point": 0, "err_msg": f"데이터 읽기 실패: {str(e)}"}
+
+# ⭐️ 원고 생성 및 차감 API
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    sheet = get_sheet()
+    gc, _ = get_gspread_client()
+    sheet = None
     target_row = 2
     current_p = 0
     search_email = req.user_email.strip().lower()
 
-    if sheet:
+    if gc:
         try:
+            sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
             records = sheet.get_all_values()
             for row_idx, row in enumerate(records[1:], start=2):
                 if len(row) >= 1:
@@ -238,7 +217,7 @@ def generate_content(req: GenerateRequest):
                 raw_val = records[1][1] if len(records[1]) > 1 else "0"
                 current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
         except Exception as e:
-            print(f"[ERROR] 시트 탐색 에러: {e}")
+            print(f"[ERROR] 시트 조회 실패: {e}")
 
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
@@ -311,7 +290,6 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 구글 시트 포인트 차감
     remaining_point = max(0, current_p - req.cost)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
