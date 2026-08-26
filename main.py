@@ -20,6 +20,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
+# 1. CORS 강제 통과 미들웨어
 class ForceCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -66,33 +67,66 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 
+# 2. JWT 서명 오류 방지 구글 인증 함수
 def get_gspread_client():
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets"
     ]
-    creds_raw = os.getenv("GOOGLE_CREDS_JSON", "").strip()
     
+    # 1순위: Render Secret Files 경로 탐색 (/etc/secrets/google_creds.json)
+    secret_paths = ["/etc/secrets/google_creds.json", "google_creds.json"]
+    for path in secret_paths:
+        if os.path.exists(path):
+            try:
+                creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
+                return gspread.authorize(creds), None
+            except Exception as e:
+                print(f"[KEYFILE_ERROR] {path}: {e}")
+
+    # 2순위: 환경변수 줄바꿈(\n) 복원 처리
+    creds_raw = os.getenv("GOOGLE_CREDS_JSON", "").strip()
     if creds_raw:
         try:
-            if "\\n" in creds_raw and "\n" not in creds_raw:
-                creds_raw = creds_raw.replace("\\n", "\n")
             creds_dict = json.loads(creds_raw)
+            if "private_key" in creds_dict:
+                # 줄바꿈 복원 핵심 처리
+                pk = creds_dict["private_key"]
+                if "\\n" in pk:
+                    creds_dict["private_key"] = pk.replace("\\n", "\n")
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             return gspread.authorize(creds), None
         except Exception as e:
             return None, f"환경변수 파싱 실패: {str(e)}"
             
-    creds_path = "google_creds.json"
-    if os.path.exists(creds_path):
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-            return gspread.authorize(creds), None
-        except Exception as e:
-            return None, f"로컬 파일 파싱 실패: {str(e)}"
-            
-    return None, "GOOGLE_CREDS_JSON 환경변수가 비어있습니다."
+    return None, "인증 키(GOOGLE_CREDS_JSON)가 없습니다."
+
+# 3. 구글 시트 탐색 (ID 및 이름 다중 탐색)
+def get_target_sheet(gc):
+    # 1) 고유 ID로 열기
+    try:
+        ss = gc.open_by_key(SPREADSHEET_ID)
+        return ss.sheet1
+    except Exception:
+        pass
+
+    # 2) 파일 이름 '블로그넷_회원관리'로 열기
+    try:
+        ss = gc.open("블로그넷_회원관리")
+        return ss.sheet1
+    except Exception:
+        pass
+
+    # 3) 공유된 첫 번째 시트 열기
+    try:
+        all_s = gc.openall()
+        if all_s:
+            return all_s[0].sheet1
+    except Exception:
+        pass
+
+    return None
 
 class PointRequest(BaseModel):
     email: str
@@ -154,17 +188,16 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 실시간 포인트 조회 API (정밀 에러 반환)
+# ⭐️ 포인트 조회
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     gc, auth_err = get_gspread_client()
     if not gc:
         return {"point": 0, "err_msg": f"인증 실패: {auth_err}"}
 
-    try:
-        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-    except Exception as e:
-        return {"point": 0, "err_msg": f"시트 접근 실패: {str(e)}"}
+    sheet = get_target_sheet(gc)
+    if not sheet:
+        return {"point": 0, "err_msg": "시트를 찾을 수 없습니다 ('블로그넷_회원관리' 확인 필요)"}
 
     try:
         records = sheet.get_all_values()
@@ -183,11 +216,11 @@ def get_user_point(req: PointRequest):
             clean_num = re.sub(r"[^\d]", "", str(raw_val))
             return {"point": int(clean_num or 0), "status": "fallback_row2", "user": records[1][0]}
 
-        return {"point": 0, "err_msg": "시트에 데이터 없음"}
+        return {"point": 0, "err_msg": "시트에 데이터가 없습니다"}
     except Exception as e:
         return {"point": 0, "err_msg": f"데이터 읽기 실패: {str(e)}"}
 
-# ⭐️ 원고 생성 및 차감 API
+# ⭐️ 원고 생성 및 차감
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
@@ -202,22 +235,23 @@ def generate_content(req: GenerateRequest):
 
     if gc:
         try:
-            sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-            records = sheet.get_all_values()
-            for row_idx, row in enumerate(records[1:], start=2):
-                if len(row) >= 1:
-                    cell_email = row[0].strip().lower()
-                    if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
-                        target_row = row_idx
-                        raw_val = row[1] if len(row) > 1 else "0"
-                        current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
-                        break
-            
-            if target_row == 2 and len(records) >= 2:
-                raw_val = records[1][1] if len(records[1]) > 1 else "0"
-                current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
+            sheet = get_target_sheet(gc)
+            if sheet:
+                records = sheet.get_all_values()
+                for row_idx, row in enumerate(records[1:], start=2):
+                    if len(row) >= 1:
+                        cell_email = row[0].strip().lower()
+                        if cell_email and (cell_email == search_email or cell_email == search_email.split('@')[0] or search_email.startswith(cell_email)):
+                            target_row = row_idx
+                            raw_val = row[1] if len(row) > 1 else "0"
+                            current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
+                            break
+                
+                if target_row == 2 and len(records) >= 2:
+                    raw_val = records[1][1] if len(records[1]) > 1 else "0"
+                    current_p = int(re.sub(r"[^\d]", "", str(raw_val)) or 0)
         except Exception as e:
-            print(f"[ERROR] 시트 조회 실패: {e}")
+            print(f"[ERROR] 시트 조회 에러: {e}")
 
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
