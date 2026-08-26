@@ -66,7 +66,6 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxD-zsNjafVwwPQmo4NOhWSu48hTE5QlX59CnylsV8l0SlqPk4zU8oudAlyEILVx_s/exec"
 
-# ⭐️ 백업용 초고속 CSV 조회 함수 (타임아웃 방지용)
 def get_point_from_csv(email: str):
     try:
         url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv"
@@ -146,7 +145,6 @@ def clean_markdown_text(text: str) -> str:
 def read_root():
     return {"status": "ok", "message": "BlogNet API Server is running"}
 
-# ⭐️ 1. 실시간 포인트 조회 API (GAS 타임아웃 시 CSV 즉시 Fallback)
 @app.post("/api/get-point")
 def get_user_point(req: PointRequest):
     try:
@@ -158,11 +156,9 @@ def get_user_point(req: PointRequest):
     except Exception:
         pass
     
-    # 지연 발생 시 빠른 CSV에서 포인트 반환
     fallback_p = get_point_from_csv(req.email)
     return {"point": fallback_p, "status": "csv_fallback", "user": req.email}
 
-# ⭐️ 2. 원고 일괄 생성 및 포인트 차감 API
 @app.post("/api/generate")
 def generate_content(req: GenerateRequest):
     task_id = str(uuid.uuid4())
@@ -190,6 +186,13 @@ def generate_content(req: GenerateRequest):
         "cafe": "맘카페/지역 커뮤니티용 일상적이고 자연스러운 추천 글/답변 어조",
         "insta": "인스타그램 피드용 감성적인 줄글과 해시태그 어조"
     }
+    channel_labels = {
+        "blog_info": "블로그(정보)",
+        "blog_review": "블로그(후기)",
+        "cafe": "카페 침투",
+        "insta": "인스타그램"
+    }
+    
     tone = channel_prompts.get(req.channel, "자연스러운 네이버 블로그 포스팅")
     brand_section = f"★ 홍보 대상 업체명(상호명): '{req.brand}' (본문 전반에 4~6회 이상 자연스럽게 강조)" if req.brand else ""
 
@@ -248,23 +251,26 @@ def generate_content(req: GenerateRequest):
             except Exception:
                 pass
 
-    # 구글 시트 실시간 차감 요청
+    title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
+    channel_display = channel_labels.get(req.channel, "블로그")
+
+    # ⭐️ 구글 시트 1번째 탭 차감 + 2번째 탭(사용내역)에 행 기록
     remaining_point = max(0, current_p - req.cost)
     try:
         deduct_params = {
             "email": req.user_email.strip().lower(),
             "action": "deduct",
-            "cost": req.cost
+            "cost": req.cost,
+            "title": title_text,
+            "channel": channel_display
         }
         d_resp = requests.get(GAS_WEBAPP_URL, params=deduct_params, timeout=15, allow_redirects=True)
         if d_resp.status_code == 200:
             remaining_point = int(d_resp.json().get("point", remaining_point))
     except Exception as e:
-        print(f"[ERROR] 차감 실패: {e}")
+        print(f"[ERROR] 차감/내역기록 실패: {e}")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
-
     meta = {
         "task_id": task_id,
         "title": title_text,
