@@ -167,7 +167,6 @@ def generate_content(req: GenerateRequest):
     task_dir = os.path.join(STORAGE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1. 포인트 확인
     current_p = 5000
     try:
         resp = requests.get(GAS_WEBAPP_URL, params={"email": req.user_email.strip().lower(), "action": "get"}, timeout=8, allow_redirects=True)
@@ -179,7 +178,6 @@ def generate_content(req: GenerateRequest):
     if current_p < req.cost:
         raise HTTPException(status_code=400, detail=f"보유 포인트가 부족합니다. (현재: {current_p}P / 필요: {req.cost}P)")
 
-    # 2. 레퍼런스 크롤링
     reference_text = ""
     if req.url:
         reference_text = crawl_naver_blog(req.url)
@@ -237,7 +235,6 @@ def generate_content(req: GenerateRequest):
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # 3. ⭐️ DALL-E 3 안전 이미지 생성 처리
     images_created = 0
     if req.image_count > 0:
         target_subject = req.brand if req.brand else req.keyword
@@ -262,7 +259,6 @@ def generate_content(req: GenerateRequest):
     title_text = f"[{req.brand}] {req.keyword}" if req.brand else f"[{req.keyword}] 마케팅 원고"
     channel_display = channel_labels.get(req.channel, "블로그")
 
-    # 4. 스프레드시트 차감 및 2번째 시트 기록
     remaining_point = max(0, current_p - req.cost)
     try:
         deduct_params = {
@@ -295,6 +291,17 @@ def generate_content(req: GenerateRequest):
         "image_count": images_created,
         "remaining_point": remaining_point
     }
+
+# 405 Method Not Allowed 방지용 라우트
+@app.get("/api/history/{user_email:path}")
+@app.post("/api/history/{user_email:path}")
+def get_user_history_path(user_email: str):
+    return {"history": []}
+
+@app.get("/api/history")
+@app.post("/api/history")
+def get_user_history_root():
+    return {"history": []}
 
 @app.get("/api/download/{task_id}")
 def download_result(task_id: str):
