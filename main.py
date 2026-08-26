@@ -67,7 +67,7 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # ⭐️ 구글 시트 고유 ID (주소창 /d/ 뒤의 긴 문자열)
 # 예: 1F21WMM5DBP... 전체를 따옴표 안에 넣어주세요
-SPREADSHEET_ID = os.getenv("1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs") 
+SPREADSHEET_ID = "1F21WMM5DBPfvDVOrNTHL7mDSLSZQnYsaJNHBjg_FXZs"
 
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
